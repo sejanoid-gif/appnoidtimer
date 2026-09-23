@@ -664,6 +664,7 @@ const defaultState = () => ({
     volume: 0.5,
     soundKind: 'chime',
     victoryKind: 'celebrate',
+    notifyEnabled: true,
   },
   usage: {
     date: todayKey(),
@@ -768,17 +769,34 @@ function updateUsageDisplay() {
   $('#usageValue').textContent = `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+// Intervals run inside a Web Worker so Chrome doesn't throttle them when the tab
+// is in the background (otherwise the end-of-timer could be detected up to 1 min late).
+function workerInterval(fn, ms) {
+  try {
+    const src = `setInterval(() => postMessage(0), ${ms});`;
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    const w = new Worker(url);
+    URL.revokeObjectURL(url);
+    w.onmessage = fn;
+    return () => w.terminate();
+  } catch (e) {
+    const id = setInterval(fn, ms);
+    return () => clearInterval(id);
+  }
+}
+
 function startTimer() {
   if (Timer.running) return;
   if (Timer.remainingMs <= 0) return;
+  requestNotifyPermission();
   Timer.running = true;
   Timer.lastTick = performance.now();
-  Timer.interval = setInterval(tick, 100);
+  Timer.interval = workerInterval(tick, 100);
   updateDisplay();
 }
 function pauseTimer() {
   Timer.running = false;
-  if (Timer.interval) clearInterval(Timer.interval);
+  if (Timer.interval) Timer.interval();
   Timer.interval = null;
   updateDisplay();
 }
@@ -811,7 +829,45 @@ function onComplete() {
   pauseTimer();
   saveNow();
   playAlarm();
+  showNotification();
+  startTitleBlink();
   $('#alarmBanner').classList.add('show');
+}
+
+// ===== NOTIFICATIONS =====
+let activeNotification = null;
+let stopTitleBlink = null;
+
+function requestNotifyPermission() {
+  if (!state.settings.notifyEnabled || !('Notification' in window)) return;
+  if (Notification.permission === 'default') Notification.requestPermission();
+}
+
+function showNotification() {
+  if (!state.settings.notifyEnabled || !('Notification' in window)) return;
+  if (Notification.permission !== 'granted') return;
+  try {
+    activeNotification = new Notification('⏰ Tempo esgotado!', {
+      body: 'Seu timer terminou. Clique para voltar ao Timer No ID.',
+      tag: 'timernoid-alarm',
+      renotify: true,
+      requireInteraction: true,
+    });
+    activeNotification.onclick = () => {
+      window.focus();
+      stopAlarm(true);
+    };
+  } catch (e) {}
+}
+
+// Blinks the tab title so the finished timer is visible even without sound
+function startTitleBlink() {
+  if (stopTitleBlink) stopTitleBlink();
+  let on = false;
+  stopTitleBlink = workerInterval(() => {
+    on = !on;
+    document.title = on ? '⏰ TEMPO ESGOTADO!' : '🔴 00:00 — Timer No ID';
+  }, 800);
 }
 
 $('#playBtn').addEventListener('click', () => { stopAlarm(); if (Timer.running) pauseTimer(); else startTimer(); });
@@ -1015,6 +1071,8 @@ function stopAlarm(playVictory = false) {
   if (alarmInterval) { clearInterval(alarmInterval); alarmInterval = null; }
   alarmNodes.forEach(n => { try { n.stop(); } catch(e) {} });
   alarmNodes = [];
+  if (activeNotification) { activeNotification.close(); activeNotification = null; }
+  if (stopTitleBlink) { stopTitleBlink(); stopTitleBlink = null; updateDisplay(); }
   $('#alarmBanner').classList.remove('show');
   if (playVictory && wasRinging && state.settings.soundEnabled) {
     setTimeout(() => fireVictory(), 80);
@@ -1182,6 +1240,12 @@ function fireVictory() {
 }
 
 // ===== SETTINGS MODAL =====
+function notifyHintText() {
+  if (!('Notification' in window)) return 'Não suportado neste navegador';
+  if (Notification.permission === 'denied') return 'Bloqueada — permita no cadeado ao lado do endereço';
+  if (Notification.permission === 'granted') return 'Avisa quando o timer termina, mesmo em outra aba';
+  return 'Clique para permitir notificações';
+}
 function renderSettings() {
   const body = $('#settingsBody');
   const s = state.settings;
@@ -1189,6 +1253,14 @@ function renderSettings() {
     <div class="setting-row">
       <div class="setting-sub"><div class="setting-label">Som do alarme</div><div class="setting-hint">Toca quando o timer termina</div></div>
       <div class="switch ${s.soundEnabled ? 'on' : ''}" data-sw="soundEnabled"></div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-sub"><div class="setting-label">Notificação do navegador</div><div class="setting-hint" id="notifyHint">${notifyHintText()}</div></div>
+      <div class="switch ${s.notifyEnabled ? 'on' : ''}" data-sw="notifyEnabled"></div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-sub"><div class="setting-label">Testar notificação</div><div class="setting-hint">Mostra uma notificação de exemplo</div></div>
+      <button class="reset-usage" id="testNotifyBtn">Testar</button>
     </div>
     <div class="setting-row">
       <div class="setting-label">Tipo de som</div>
@@ -1226,8 +1298,21 @@ function renderSettings() {
     </div>
   `;
   body.querySelectorAll('[data-sw]').forEach(sw => {
-    sw.onclick = () => { const k = sw.dataset.sw; s[k] = !s[k]; save(); renderSettings(); };
+    sw.onclick = async () => {
+      const k = sw.dataset.sw; s[k] = !s[k]; save();
+      if (k === 'notifyEnabled' && s[k] && 'Notification' in window && Notification.permission === 'default') {
+        await Notification.requestPermission();
+      }
+      renderSettings();
+    };
   });
+  $('#testNotifyBtn').onclick = async () => {
+    if (!('Notification' in window)) return alert('Este navegador não suporta notificações.');
+    if (Notification.permission === 'default') await Notification.requestPermission();
+    if (Notification.permission !== 'granted') { renderSettings(); return alert('Notificações bloqueadas. Clique no cadeado ao lado do endereço do site e permita "Notificações".'); }
+    new Notification('⏰ Tempo esgotado!', { body: 'Assim vai aparecer quando o timer acabar.', tag: 'timernoid-test' });
+    renderSettings();
+  };
   body.querySelectorAll('[data-in]').forEach(inp => {
     inp.oninput = () => {
       const k = inp.dataset.in;
